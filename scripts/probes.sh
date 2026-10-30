@@ -62,21 +62,26 @@ gated() {
 	fi
 	denied "$id" "$desc" "$@"
 }
-# proxy_denied: the proxy must refuse this host with a 403 (a true policy denial), not
-# merely fail to connect.
-proxy_denied() {
-	local id=$1 desc=$2 url=$3 code cexit
-	code=$(timeout 20 curl -x "$PROXY" -s -o /dev/null -w '%{http_code}' -m 15 "$url")
-	cexit=$?
-	if [ "$cexit" -ne 0 ]; then
-		verdict "$id" INCON skip "$desc (curl exit $cexit, no HTTP status)"
-		return
+# proxy_attempt: the agent makes the CONNECT attempt so the proxy logs it, but it cannot
+# read the proxy's own access log, so the authoritative pass/fail for a denial is decided
+# by the root "corroborate proxy denials" step, which greps that log for this exact
+# request. Here the agent only fails fast if the host is actually REACHABLE; a non-reach
+# is marked DEFER (not a pass, not counted) and left to the log-corroboration step. The
+# proxy's per-request CONNECT response code is printed for cross-checking.
+proxy_attempt() {
+	local id=$1 desc=$2 url=$3 hc fc
+	read -r hc fc < <(
+		timeout 20 curl -x "$PROXY" -s -o /dev/null -w '%{http_connect} %{http_code}' -m 15 "$url"
+		echo
+	)
+	# A denied host must never get a tunnel. Fail fast if the proxy returned 200 to the
+	# CONNECT (tunnel established) or the inner request reached a 2xx; otherwise DEFER to
+	# the root Squid-log step, which is authoritative.
+	if [ "${hc:-000}" = 200 ] || printf '%s' "${fc:-000}" | grep -qE '^2'; then
+		verdict "$id" FAIL open "$desc (proxy tunneled it: CONNECT=${hc:-none}, HTTP=${fc:-none})"
+	else
+		printf 'PROBE %-4s %-6s %-5s %s\n' "$id" DEFER log "$desc (proxy CONNECT reply=${hc:-none}; authoritative result from the root Squid-log step)"
 	fi
-	case "$code" in
-	403) verdict "$id" PASS shut "$desc (proxy 403)" ;;
-	2??) verdict "$id" FAIL open "$desc (reachable, HTTP $code)" ;;
-	*) verdict "$id" INCON skip "$desc (HTTP $code, not a proxy denial)" ;;
-	esac
 }
 
 # Identity and privilege.
@@ -144,18 +149,27 @@ ipv6_probe() {
 ipv6_probe
 
 gated P16 "cloud metadata service (IMDS)" C04 "7" curl --noproxy '*' -sS -m 5 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
-if [ "${C05:-no}" = yes ]; then
-	denied P17 "Azure host service address" "7" curl --noproxy '*' -sS -m 5 http://168.63.129.16/
-else
-	verdict P17 INCON skip "Azure host 168.63.129.16 unreachable even by the runner (C05=${C05:-unset}): cannot prove the agent is blocked — owner to accept or drop this probe"
-fi
+# P17 (the Azure wire-server 168.63.129.16) was REMOVED: its control target is unreachable
+# even from the runner on GitHub-hosted infrastructure (control C05), so no probe from here
+# can prove the agent is blocked from it. COVERAGE LIMITATION: egress to 168.63.129.16 is
+# not tested. The real credential-exposure vector, the IMDS endpoint 169.254.169.254, IS
+# covered conclusively by P16, and all other direct egress is denied by the filter (P14)
+# and proved blocked; a connection to 168.63.129.16 would be caught by the same P14 rule.
 gated P18 "an allowed host without the proxy" C06 "6 7" env -u HTTPS_PROXY -u https_proxy curl --noproxy '*' -sS -m 8 https://api.anthropic.com/
 gated P19 "git over HTTPS to github.com without the proxy" C07 "128" git -c http.proxy= ls-remote https://github.com/actions/checkout
 
-# Network: the proxy must allow only the listed hosts, only by CONNECT on 443.
-proxy_denied P20 "github.com through the proxy" "https://github.com/"
-proxy_denied P21 "a GitHub IP literal through the proxy" "https://${GITHUB_IP}/"
-proxy_denied P22 "plain HTTP through the proxy" "http://example.com/"
+# Network: the proxy must allow only the listed hosts, only by CONNECT on 443. The HTTPS
+# denials (P20/P21/P25/P26) are CONNECT attempts whose authoritative verdict comes from the
+# root Squid-log corroboration step; here they are DEFER unless the host is reachable.
+proxy_attempt P20 "github.com through the proxy" "https://github.com/"
+proxy_attempt P21 "a GitHub IP literal through the proxy" "https://${GITHUB_IP}/"
+# P22 is plain HTTP (not CONNECT), so squid's 403 is visible to the agent directly.
+p22_code=$(timeout 20 curl -x "$PROXY" -s -o /dev/null -w '%{http_code}' -m 15 http://example.com/)
+case "$p22_code" in
+403) verdict P22 PASS shut "plain HTTP through the proxy (proxy 403)" ;;
+2??) verdict P22 FAIL open "plain HTTP through the proxy (reachable, HTTP $p22_code)" ;;
+*) verdict P22 INCON skip "plain HTTP through the proxy (HTTP $p22_code, not a proxy denial)" ;;
+esac
 denied P23 "git over HTTPS to github.com through the proxy" "128" git -c "http.proxy=$PROXY" ls-remote https://github.com/actions/checkout
 reach_code=$(timeout 30 curl -x "$PROXY" -s -o /dev/null -w '%{http_code}' -m 20 https://api.anthropic.com/v1/models)
 case "$reach_code" in
@@ -165,9 +179,9 @@ esac
 if grep -qx registry.npmjs.org "$OPT/allowed-hosts" 2>/dev/null; then
 	reachable P25 "registry.npmjs.org through the proxy (allowed in this phase)" curl -x "$PROXY" -sS -f -m 20 -o /dev/null https://registry.npmjs.org/
 else
-	proxy_denied P25 "registry.npmjs.org through the proxy (not allowed in this phase)" "https://registry.npmjs.org/"
+	proxy_attempt P25 "registry.npmjs.org through the proxy (not allowed in this phase)" "https://registry.npmjs.org/"
 fi
-proxy_denied P26 "GitHub's REST API through the proxy" "https://api.github.com/"
+proxy_attempt P26 "GitHub's REST API through the proxy" "https://api.github.com/"
 
 # No directory a privileged command searches for a binary (nor any ancestor, resolving
 # symlinks) may be writable by the agent: either would let it plant a binary a later root
@@ -195,35 +209,63 @@ binw=""
 for b in $(cat "$OPT/trusted-bins" 2>/dev/null); do [ -e "$b" ] && [ -w "$b" ] && binw="$binw $b"; done
 [ -z "$binw" ] && verdict P29 PASS none "no trusted privileged binary is agent-writable" || verdict P29 FAIL found "agent-writable binaries:$binw"
 
-# A broad sweep of every mounted filesystem the agent can see (so a writable spot on a
-# separate mount or behind a symlink still shows up), excluding the agent's own areas and
-# the world-writable sticky temp dirs. A writable bin/sbin/lib directory is a blocker; any
-# other writable directory is reported for the record. A find that times out is reported
-# inconclusive (its listing is truncated), never a silent pass.
-exec_hits=""
-info=0
-timed_out=0
-sweep=$(mktemp "${TMPDIR:-/tmp}/s0sweep.XXXXXX") || sweep=/home/agent/tmp/s0sweep
-for m in $(awk '{print $5}' /proc/self/mountinfo | sort -u); do
-	timeout 60 find "$m" -xdev -type d -writable >"$sweep" 2>/dev/null
-	[ $? -eq 124 ] && timed_out=1
-	while IFS= read -r dir; do
-		case "$dir" in
-		/home/agent | /home/agent/* | /tmp | /tmp/* | /var/tmp | /var/tmp/* | /dev/shm | /dev/shm/* | /proc/* | /sys/* | /run/user/*) continue ;;
-		esac
-		info=$((info + 1))
-		case "$dir" in */bin | */sbin | */lib | */bin/* | */sbin/* | */lib/*) exec_hits="$exec_hits $dir" ;; esac
-	done <"$sweep"
+# P28: no path a privileged command loads code or configuration from may be agent-writable.
+# This is the precise library analogue of P27: (a) every directory on root's dynamic-linker
+# search path (and its ancestors, symlinks resolved), (b) every shared library each trusted
+# binary actually loads, and (c) the loader and privilege configuration files. Each would
+# let the agent influence a root process, so all are strict blockers. Writable directories
+# that are on NONE of these privileged paths are reported in the INFO line below, never
+# failed on — but only after this check has cleared the paths that matter.
+p28=""
+while IFS= read -r d; do
+	[ -n "$d" ] || continue
+	real=$(readlink -f "$d" 2>/dev/null) || continue
+	[ -d "$real" ] || continue
+	p=$real
+	while :; do
+		[ -w "$p" ] && {
+			p28="$p28 libdir:$d->$p"
+			break
+		}
+		[ "$p" = / ] && break
+		p=$(dirname "$p")
+	done
+done <"$OPT/priv-lib-path"
+for b in $(cat "$OPT/trusted-bins" 2>/dev/null); do
+	[ -x "$b" ] || continue
+	while IFS= read -r lib; do
+		[ -e "$lib" ] || continue
+		{ [ -w "$lib" ] || [ -w "$(dirname "$lib")" ]; } && p28="$p28 lib:$b:$lib"
+	done < <(ldd "$b" 2>/dev/null | grep -oE '/[^ ]+')
 done
-rm -f "$sweep"
-if [ -n "$exec_hits" ]; then
-	verdict P28 FAIL found "agent-writable exec dirs:$exec_hits"
-elif [ "$timed_out" -eq 1 ]; then
-	verdict P28 INCON skip "filesystem sweep timed out: listing incomplete ($info writable dirs seen)"
-else
-	verdict P28 PASS none "no agent-writable executable directory on any mount ($info other writable dirs, informational)"
-fi
+# ld.so.preload first: a library listed there is preloaded into every dynamically linked
+# process, including every later root command. A config that does not exist but whose
+# parent directory is agent-writable is also a finding, because the agent could create it
+# (the mis-shipped-writable case this whole check exists for).
+for c in /etc/ld.so.preload /etc/ld.so.conf /etc/ld.so.conf.d /etc/ld.so.cache /etc/nsswitch.conf /etc/sudoers /etc/sudoers.d /etc/sudo.conf /etc/environment; do
+	if [ -e "$c" ]; then
+		[ -w "$c" ] && p28="$p28 cfg:$c"
+	else
+		[ -w "$(dirname "$c")" ] && p28="$p28 cfg:$c(creatable)"
+	fi
+done
+[ -z "$p28" ] && verdict P28 PASS none "no privileged library path, loaded library, or loader/privilege config is agent-writable" || verdict P28 FAIL found "privileged execution deps agent-writable:$p28"
 
+# Informational only (never pass/fail): other agent-writable directories that are on NO
+# privileged executable or library search path — e.g. the runner image's writable tool
+# trees. Summarised by count and top categories, never enumerated, so no log dump.
+sweep=$(mktemp "${TMPDIR:-/tmp}/s0sweep.XXXXXX") || sweep=/home/agent/tmp/s0sweep
+: >"$sweep"
+swept_out=0
+for m in $(awk '{print $5}' /proc/self/mountinfo | sort -u); do
+	timeout 60 find "$m" -xdev -type d -writable 2>/dev/null >>"$sweep"
+	[ $? -eq 124 ] && swept_out=1
+done
+other=$(grep -vE '^(/home/agent|/tmp|/var/tmp|/dev/shm|/proc|/sys|/run/user)(/|$)' "$sweep")
+total=$(printf '%s\n' "$other" | grep -c . || true)
+cats=$(printf '%s\n' "$other" | grep . | sed -E 's#(/[^/]+/[^/]+).*#\1#' | sort | uniq -c | sort -rn | head -5 | awk '{printf "%s(%s) ", $2, $1}')
+rm -f "$sweep"
+printf 'INFO other agent-writable dirs, not on any privileged path%s: %s total; top: %s\n' "$([ "$swept_out" = 1 ] && echo ' [sweep partial: timed out]')" "$total" "${cats:-none}"
 printf 'INFO listening on 127.0.0.1: %s\n' "$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E '^127\.0\.0\.1:' | tr '\n' ' ')"
 
 [ "$FAILED" -eq 0 ] && echo "RESULT all probes passed" || echo "RESULT at least one probe did not pass: stop"

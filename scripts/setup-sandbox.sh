@@ -66,13 +66,16 @@ chmod 644 /etc/squid/squid.conf
 systemctl restart squid
 log "squid on 127.0.0.1:${PROXY_PORT}, allowing: ${ALLOW_HOSTS[*]}"
 
-# 4. Close every privileged executable-search directory to non-root writers (done after
-#    the squid install so its binaries are already placed). Idempotent on a normal system;
-#    it repairs a runner image that ships one of them writable. Resolves symlinks so /bin
-#    and /sbin are covered. Never recursive: only these directories are touched.
-harden_exec_paths() {
-	local d real before after changed=0
-	for d in ${PRIV_PATH//:/ }; do
+# 4. Close every directory a privileged command would search for an executable OR a shared
+#    library to non-root writers (done after the squid install so its binaries are placed).
+#    This covers the exec PATH and the dynamic-linker search path (ld.so.conf*), because a
+#    writable library directory on that path lets the agent plant a library a root process
+#    would load. Idempotent on a normal system; it repairs a runner image that ships one
+#    writable. Resolves symlinks. Never recursive: only these directories are touched.
+harden_dirs() { # <label> <dir...>
+	local label=$1 d real before after changed=0
+	shift
+	for d in "$@"; do
 		real=$(readlink -f "$d" 2>/dev/null) || continue
 		[ -d "$real" ] || continue
 		before=$(stat -c '%a %U:%G' "$real")
@@ -80,13 +83,34 @@ harden_exec_paths() {
 		chmod go-w "$real"
 		after=$(stat -c '%a %U:%G' "$real")
 		[ "$before" = "$after" ] || {
-			log "path hardened $d ($real): $before -> $after"
+			log "$label hardened $d ($real): $before -> $after"
 			changed=$((changed + 1))
 		}
 	done
-	log "privileged executable search paths checked ($changed changed)"
+	log "$label directories checked ($changed changed)"
 }
-harden_exec_paths
+# The dynamic-linker search path: the defaults plus every directory ld.so.conf references,
+# following one level of `include <glob>` directives so a dir pulled in by an include is
+# not missed.
+lib_search_dirs() {
+	local f g
+	{
+		echo /lib /lib64 /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+		for f in /etc/ld.so.conf /etc/ld.so.conf.d/*.conf; do
+			[ -r "$f" ] || continue
+			grep -E '^[[:space:]]*/' "$f"
+			while read -r _ g; do
+				# shellcheck disable=SC2086
+				[ -n "$g" ] && cat $g 2>/dev/null
+			done < <(grep -E '^[[:space:]]*include[[:space:]]' "$f")
+		done
+	} | grep -E '^[[:space:]]*/' | awk '{print $1}' | sort -u
+}
+LIB_DIRS=$(lib_search_dirs)
+# shellcheck disable=SC2086
+harden_dirs exec-path ${PRIV_PATH//:/ }
+# shellcheck disable=SC2086
+harden_dirs lib-path $LIB_DIRS
 
 # Each trusted binary must be a root-owned regular file no other user can overwrite. An
 # anomaly (missing, not root-owned) stops the job before any untrusted code runs.
@@ -108,6 +132,7 @@ harden_bins() {
 }
 harden_bins
 printf '%s\n' "$PRIV_PATH" >"$OPT/priv-path"
+printf '%s\n' "$LIB_DIRS" >"$OPT/priv-lib-path"
 
 # 5. Packet filter, by user. The agent may reach only 127.0.0.1 (the proxy and local test
 #    servers), never the DNS stub at 127.0.0.53; all IPv6 is administratively prohibited.
@@ -147,8 +172,11 @@ else
 	log "IPv6 loopback control FAILED; the IPv6 probe will be inconclusive (and fail closed)"
 fi
 
-# 7. Probe scripts and the data they read, readable by the agent but not writable.
+# 7. Probe scripts and the data they read, readable by the agent but not writable. The
+#    corroboration script is root-run after the agent phase; keeping it under root-owned
+#    /opt/s0 puts it out of the agent's reach.
 install -o root -g root -m 755 "$HERE/probes.sh" "$OPT/probes.sh"
+install -o root -g root -m 755 "$HERE/corroborate-proxy.sh" "$OPT/corroborate-proxy.sh"
 printf '%s\n' "${ALLOW_HOSTS[@]}" >"$OPT/allowed-hosts"
-chmod 644 "$OPT/priv-path" "$OPT/trusted-bins" "$OPT/allowed-hosts" "$OPT/ipv6-port" "$OPT/ipv6-hb" "$OPT/ipv6-ctl" 2>/dev/null || true
+chmod 644 "$OPT/priv-path" "$OPT/priv-lib-path" "$OPT/trusted-bins" "$OPT/allowed-hosts" "$OPT/ipv6-port" "$OPT/ipv6-hb" "$OPT/ipv6-ctl" 2>/dev/null || true
 log "done"

@@ -44,6 +44,14 @@ jobs:
             HTTPS_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 \
             /usr/bin/bash /opt/s0/probes.sh /opt/s0/controls.env | tee probes.txt
 
+      # Authoritative verdict for the HTTPS CONNECT denials (P20/P21/P25/P26): the agent
+      # cannot read the proxy log, so root cross-checks each against the Squid access log.
+      - name: Corroborate proxy denials against the Squid log (root)
+        if: always()
+        run: |
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          sudo /usr/bin/bash /opt/s0/corroborate-proxy.sh | tee corroborate.txt
+
       - name: Collect the proxy log
         if: always()
         run: |
@@ -59,5 +67,6 @@ jobs:
             controls.txt
             setup.txt
             probes.txt
+            corroborate.txt
             squid-access.txt
           retention-days: 30
