@@ -1,0 +1,56 @@
+# Non-agent security checks for the S0-a pilot. No coding agent runs here and no secret is
+# used. Started only by hand by someone with write access (workflow_dispatch); no
+# pull_request, pull_request_target, push or comment triggers exist in this repository.
+name: isolation-probes
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolation-probes
+  cancel-in-progress: false
+
+jobs:
+  probes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out (read-only token, not persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Positive controls, as the runner user, before the sandbox exists
+        run: bash scripts/controls.sh controls.env | tee controls.txt
+
+      - name: Build the sandbox (root)
+        run: |
+          sudo bash scripts/setup-sandbox.sh | tee setup.txt
+          sudo install -o root -g root -m 644 controls.env /opt/s0/controls.env
+
+      - name: Probes, as the unprivileged agent user with a clean environment
+        run: |
+          set -o pipefail
+          sudo runuser -u agent -- env -i \
+            HOME=/home/agent TMPDIR=/home/agent/tmp PATH=/usr/local/bin:/usr/bin:/bin \
+            HTTPS_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 \
+            bash /opt/s0/probes.sh /opt/s0/controls.env | tee probes.txt
+
+      - name: Collect the proxy log
+        if: always()
+        run: sudo cat /var/log/squid/access.log > squid-access.txt 2>/dev/null || true
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isolation-probes
+          path: |
+            controls.txt
+            setup.txt
+            probes.txt
+            squid-access.txt
+          retention-days: 30
