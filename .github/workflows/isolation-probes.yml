@@ -26,22 +26,29 @@ jobs:
       - name: Positive controls, as the runner user, before the sandbox exists
         run: bash scripts/controls.sh controls.env | tee controls.txt
 
+      # From here on, every privileged command uses a PATH of root-owned directories only
+      # (no /usr/local/bin, no agent-writable directory) and names its trusted binaries by
+      # absolute path, so untrusted code that ran earlier cannot influence what runs here.
       - name: Build the sandbox (root)
         run: |
-          sudo bash scripts/setup-sandbox.sh | tee setup.txt
-          sudo install -o root -g root -m 644 controls.env /opt/s0/controls.env
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          sudo /usr/bin/bash scripts/setup-sandbox.sh | tee setup.txt
+          sudo /usr/bin/install -o root -g root -m 644 controls.env /opt/s0/controls.env
 
       - name: Probes, as the unprivileged agent user with a clean environment
         run: |
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
           set -o pipefail
-          sudo runuser -u agent -- env -i \
-            HOME=/home/agent TMPDIR=/home/agent/tmp PATH=/usr/local/bin:/usr/bin:/bin \
+          sudo /usr/sbin/runuser -u agent -- /usr/bin/env -i \
+            HOME=/home/agent TMPDIR=/home/agent/tmp PATH=/usr/bin:/bin \
             HTTPS_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 \
-            bash /opt/s0/probes.sh /opt/s0/controls.env | tee probes.txt
+            /usr/bin/bash /opt/s0/probes.sh /opt/s0/controls.env | tee probes.txt
 
       - name: Collect the proxy log
         if: always()
-        run: sudo cat /var/log/squid/access.log > squid-access.txt 2>/dev/null || true
+        run: |
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          sudo /usr/bin/cat /var/log/squid/access.log >squid-access.txt 2>/dev/null || true
 
       - name: Upload the evidence
         if: always()
