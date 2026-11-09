@@ -1,0 +1,160 @@
+# JOB A (development) — PREPARATION SKELETON. Manual-only; NOT runnable yet; agent execution
+# NO-GO. This is the smallest GitHub-native workflow that could eventually let Claude Code solve
+# ONE authorized S0-a p-queue task and emit the existing submission.json + patch.diff artifact the
+# PROVEN two-runner verifier consumes. It runs NO agent and NO candidate today: the agent step
+# FAILS CLOSED until (1) a credential-isolation proxy exists + is verified, and (2) Gate A (owner
+# GO/NO-GO) and a separate spend authorization are granted. Design + blockers: docs/jobA-design.md.
+# Gated by ticket-dispatcher/docs/plans/s0a-security-gates.md (Gate A, UNAPPROVED).
+#
+# ISOLATION INVARIANTS (must hold for any future run):
+#   * Job A NEVER checks out, mounts, or references s0-truth, the hidden tests, the reference
+#     solutions, the verifier code, or any private repository credential.
+#   * No repo write: permissions are contents:read only; no GITHUB_TOKEN write scope; no push/PR/merge.
+#   * The model credential is NEVER in the agent step's environment or reachable by its shell; it
+#     lives only in a separate credential-injecting proxy the agent cannot read (NOT built yet).
+#   * Job A and the private verification jobs run on SEPARATE runners (the proven pattern).
+name: dev-jobA-pqueue
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "authorized S0-a task id (e.g. C1); must be the autonomous-lane member per the recorded coin flip"
+        required: true
+      attempt:
+        description: "attempt (positive integer)"
+        required: true
+        default: "1"
+      base:
+        description: "authorized base sha = fix~1 (40/64-hex), orchestrator-supplied"
+        required: true
+      ticket_ref:
+        description: "public ticket file/ref in THIS repo (never from s0-truth)"
+        required: true
+
+permissions:
+  contents: read # checkout + public clone only; NO write scope anywhere
+
+concurrency:
+  group: dev-jobA-pqueue
+  cancel-in-progress: false
+
+jobs:
+  develop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30 # explicit wall-clock bound for the whole job
+    permissions:
+      contents: read
+    steps:
+      - name: NO-GO gate — refuse agent execution until blockers clear (fail closed)
+        # The whole job fails here on purpose. Flip NONE of this on without: the credential-
+        # isolation proxy implemented + adversarially verified; Gate A written owner GO/NO-GO;
+        # a separate spend authorization; and the recorded coin-flip lane assignment.
+        run: |
+          set -euo pipefail
+          echo "REFUSE: Job A agent execution is NO-GO (preparation skeleton)."
+          echo "Blockers (docs/jobA-design.md §9):"
+          echo "  1. credential-isolation proxy not implemented/verified (model key must be"
+          echo "     unreachable by agent shell — correction 4/7);"
+          echo "  2. Gate A (owner GO/NO-GO) UNAPPROVED and no separate spend authorization;"
+          echo "  3. recorded coin-flip lane assignment for the pilot task not confirmed."
+          exit 1
+
+      - name: Checkout this repo (pinned; credentials not persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (allowlisted)
+        with:
+          persist-credentials: false
+
+      - name: Validate authorized inputs (strict; env-passed, never inlined into shell)
+        env:
+          IN_TASK: "${{ inputs.task }}"
+          IN_ATTEMPT: "${{ inputs.attempt }}"
+          IN_BASE: "${{ inputs.base }}"
+          IN_TICKET: "${{ inputs.ticket_ref }}"
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os, re, sys
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", os.environ.get("IN_TASK", "")):
+              sys.exit("REFUSE: bad task id")
+          a = os.environ.get("IN_ATTEMPT", "")
+          if not re.fullmatch(r"[0-9]{1,4}", a) or not (1 <= int(a) <= 1000):
+              sys.exit("REFUSE: bad attempt")
+          if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", os.environ.get("IN_BASE", "")):
+              sys.exit("REFUSE: base is not 40/64-hex")
+          # ticket_ref must be a repo-relative path with NO traversal (no absolute, no '..'),
+          # so it can only ever name a file inside this public repo (never ../s0-truth/...).
+          t = os.environ.get("IN_TICKET", "")
+          if (not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", t) or t.startswith("/")
+                  or ".." in t.split("/")):
+              sys.exit("REFUSE: ticket_ref must be a repo-relative path with no traversal")
+          print("inputs OK")
+          PY
+
+      - name: Prepare the authorized DEVELOPMENT source (public p-queue @ base; no hidden tests)
+        env:
+          IN_BASE: "${{ inputs.base }}"
+        run: |
+          set -euo pipefail
+          # Public upstream only; the hidden tests are ADDED by the fix, so they are absent at base.
+          git clone --no-checkout --filter=blob:none https://github.com/sindresorhus/p-queue "$RUNNER_TEMP/dev"
+          git -C "$RUNNER_TEMP/dev" checkout -q "$IN_BASE"
+          test -d "$RUNNER_TEMP/dev/source" || { echo "REFUSE: base has no source/ dir"; exit 1; }
+          echo "dev source ready at base $IN_BASE (source-only patching enforced downstream)"
+
+      # ---------------------------------------------------------------------------------------
+      # INTENDED hardened agent step (DISABLED — documented, not executed). Enable ONLY after the
+      # credential-isolation proxy exists and Gate A + spend are approved. Reference design:
+      #
+      #   - name: Run hardened Claude Code behind the credential proxy
+      #     env:
+      #       ANTHROPIC_BASE_URL: http://127.0.0.1:${{ env.PROXY_PORT }}   # key lives ONLY in the proxy
+      #       # NO ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN here. "Unreachable" requires OS/namespace
+      #       # isolation — a SEPARATE netns/container or runner for the key, NOT a same-uid sidecar (a
+      #       # same-uid agent can read /proc/<pid>/environ or fds), and NOT the tool allowlist.
+      #       CLAUDE_CONFIG_DIR: ${{ runner.temp }}/ccfg                   # fresh per run
+      #     run: |
+      #       npm i -g --ignore-scripts @anthropic-ai/claude-code@<PINNED.EXACT.VERSION>   # npm does NOT
+      #         # verify signatures by default: pin exact + enforce integrity (lockfile/provenance hash)
+      #       claude -p "$(cat "$RUNNER_TEMP/ticket.md")" \   # ticket.md built ONLY from the validated ticket_ref
+      #         --setting-sources user --disable-all-hooks \
+      #         --allowed-tools "Read,Edit,Write,Bash(npm test:*)" \   # `npm test` runs UNTRUSTED upstream
+      #         # package scripts → must run net-isolated + unprivileged, with the key out of its namespace
+      #         --max-turns <N> --add-dir "$RUNNER_TEMP/dev" --cwd "$RUNNER_TEMP/dev"
+      #     # timeout via step-level timeout-minutes + agent --max-turns; spend via a credits-only,
+      #     # per-run-capped key AT THE PROXY (never here); the agent may edit ONLY source/**.
+      # ---------------------------------------------------------------------------------------
+
+      - name: Package the submission (source-only; same contract as the proven path)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dev"
+          # The agent edits only source/**; the patch is the source-only diff.
+          git add -A source
+          git diff --cached -- source > "$RUNNER_TEMP/patch.diff"
+          test -s "$RUNNER_TEMP/patch.diff" || { echo "REFUSE: empty patch (no source change produced)"; exit 1; }
+          # Defense in depth: refuse anything the diff touches outside source/ (verifier re-checks).
+          if git diff --cached --name-only | grep -qvE '^source/'; then
+            echo "REFUSE: patch touches paths outside source/"; exit 1
+          fi
+          python3 -I - "$IN_BASE" <<'PY'
+          import json, os, sys
+          sub = {"schema": "s0.submission/v1", "task": os.environ["IN_TASK_OUT"],
+                 "attempt": int(os.environ["IN_ATTEMPT_OUT"]), "base": sys.argv[1],
+                 "patch": "patch.diff"}
+          json.dump(sub, open(os.environ["RUNNER_TEMP"] + "/submission.json", "w"))
+          PY
+          mkdir -p art
+          cp "$RUNNER_TEMP/submission.json" "$RUNNER_TEMP/patch.diff" art/
+        env:
+          IN_BASE: "${{ inputs.base }}"
+          IN_TASK_OUT: "${{ inputs.task }}"
+          IN_ATTEMPT_OUT: "${{ inputs.attempt }}"
+
+      - name: Upload the submission artifact (flat; consumed by the two-runner verifier)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (allowlisted)
+        with:
+          name: submission
+          path: art/
+          if-no-files-found: error
+          retention-days: 1
