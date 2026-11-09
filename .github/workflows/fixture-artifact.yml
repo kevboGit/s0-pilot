@@ -1,0 +1,84 @@
+# SYNTHETIC FIXTURE PRODUCER -- manually triggered, AGENT-FREE. It builds a harmless, deterministic
+# submission artifact (submission.json + patch.diff) and uploads it, so the trusted s0-truth
+# fetch-artifact.py can later retrieve it for ONE real cross-repository transport test. It runs NO
+# candidate code, NO AI agent, uses NO secrets, and touches no other workflow (isolation-probes.yml
+# is untouched). It copies NOTHING private from s0-truth (no hidden tests, reference answers, or
+# verification evidence) -- only public, synthetic source + the task metadata supplied at dispatch.
+#
+# The downloaded artifact zip MUST contain EXACTLY two FLAT entries -- submission.json and
+# patch.diff at the root (no subdirectory) -- to match handoff.py's safe_unzip + the Increment-1
+# validator. task/attempt/base are dispatch inputs so the fixture matches a KNOWN synthetic
+# verification case on the s0-truth side: `base` is the fix~1 commit sha of that case's offline
+# manifest, and the patch applies onto a source/x.ts whose base content is `const a = 1;`.
+name: fixture-artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "task id (must equal the trusted authority's task; validator: [A-Za-z0-9._-]{1,64})"
+        required: true
+        default: "T1"
+      attempt:
+        description: "attempt (positive integer; must equal the authority's attempt)"
+        required: true
+        default: "1"
+      base:
+        description: "base commit sha (40 hex) the patch applies onto; the authority/manifest fix~1"
+        required: true
+
+permissions:
+  contents: read # least privilege; artifact upload needs no write scopes
+
+concurrency:
+  group: fixture-artifact
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Generate the synthetic flat submission (submission.json + patch.diff)
+        env:
+          task: ${{ inputs.task }}
+          attempt: ${{ inputs.attempt }}
+          base: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          rm -rf art && mkdir art
+          python3 - "$task" "$attempt" "$base" <<'PY'
+          import json, re, sys
+          task, attempt, base = sys.argv[1], sys.argv[2], sys.argv[3]
+          # fail closed on metadata the s0-truth validator/handoff would reject
+          assert re.fullmatch(r"[A-Za-z0-9._-]{1,64}", task), "bad task"
+          assert attempt.isdigit() and 1 <= int(attempt) <= 1000, "bad attempt"
+          assert re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", base), "bad base sha"
+          # a harmless, deterministic SOURCE-ONLY patch; exact bytes (trailing newline included)
+          patch = (
+              "diff --git a/source/x.ts b/source/x.ts\n"
+              "index 1111111..2222222 100644\n"
+              "--- a/source/x.ts\n"
+              "+++ b/source/x.ts\n"
+              "@@ -1 +1,2 @@\n"
+              " const a = 1;\n"
+              "+const b = 2;\n"
+          )
+          with open("art/patch.diff", "w", newline="") as fh:
+              fh.write(patch)
+          with open("art/submission.json", "w") as fh:
+              json.dump({"schema": "s0.submission/v1", "task": task,
+                         "attempt": int(attempt), "base": base, "patch": "patch.diff"}, fh)
+          PY
+          # exactly two flat files, nothing else
+          test "$(find art -mindepth 1 | sort | tr '\n' ' ')" = "art/patch.diff art/submission.json "
+          ls -l art
+
+      - name: Upload the artifact (flat entries at the zip root)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # allowlisted on s0-pilot
+        with:
+          name: submission # must equal the authority's artifact_name
+          path: art/ # single-dir root -> flat zip entries: submission.json, patch.diff
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
