@@ -2,6 +2,8 @@
 
 Approved maximum for S0-a: **$50**. Four layers, from the inside out.
 
+**These dollar controls are API-mode only.** Layers 1–3 (the per-task guard, the scheduler stop, and the Console-workspace spend cap) apply when a run uses a paid **Anthropic API key**. The intended Phase-1 lane uses the owner's **Max subscription** (a `claude setup-token`, no API key, no Console workspace): it incurs **no separate API billing**, so these dollar caps do not apply — its control is the **subscription usage-limit pause/resume** (session + weekly limits), not a dollar budget. A Console workspace and its spend cap are **not a prerequisite** for the subscription lane. See `ticket-dispatcher/docs/plans/autonomy-roadmap.md` "Operating mode: subscription-first".
+
 | Layer         | Control                                                                                                                                                                                                     | Status                                                             |
 | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | 1. Per task   | `spend/task-guard.mjs` kills the run's process group when its running cost passes the cap minus a margin. Cap **$6**; margin **$2** until the dry run measures its accuracy, so it trips at **$4** computed | Accounting checked offline against 8 recorded runs (below)         |
