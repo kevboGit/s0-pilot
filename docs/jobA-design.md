@@ -84,11 +84,24 @@ source; the validator's full policy in `s0-truth/validation/submission-validator
   implemented or verified yet** → the first real Claude Code run is **NO-GO** until it exists
   and an adversarial check confirms the agent cannot read the key (env/fd/`/proc`/filesystem
   scan from a same-uid process).
+- **Subscription (Max) mode — a SEPARATE, UNPROVEN boundary (Gate-A requirement).** The design
+  above is the **API-key** boundary. For the intended Phase-1 **Max subscription** lane (the
+  owner's `claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`, unmodified client, **non-bare** — note
+  `--bare` ignores the OAuth token), the credential-injecting proxy **does not apply**: the
+  subscription OAuth token must **not** be intermediated by our gateway (Anthropic terms on
+  intermediating consumer credentials). The agent would hold its own token, so a tool-capable agent
+  (Bash/file/hooks/MCP) could read it, and an egress allowlist to Anthropic alone is **insufficient
+  proof** of non-exfiltration (a secret can ride inside authorized model traffic). This
+  subscription-mode boundary is **not proven and not accepted** — an unresolved Gate-A security
+  requirement, distinct from the API-mode item above. See
+  `ticket-dispatcher/docs/plans/autonomy-roadmap.md` "Operating mode: subscription-first".
 - **Network egress.** Default-deny; allow only the proxy endpoint and the public npm/p-queue
   fetch needed to prepare the base. No access to s0-truth, hidden tests, or private creds.
-- **Spend.** The **$50 is a maximum experimental budget, not an authorization**
-  (`s0-pilot/docs/spend-controls.md`). A credits-only / per-run-capped key, a provider spend
-  cap, and a per-run turn/token ceiling; every spend and every run approved separately.
+- **Spend (API mode only).** The **$50 is a maximum experimental budget, not an authorization**
+  (`s0-pilot/docs/spend-controls.md`). In **API mode**: a credits-only / per-run-capped key, a
+  provider spend cap, and a per-run turn/token ceiling; every spend and every run approved
+  separately. The **subscription (Max) lane has no API spend cap** — its control is the
+  subscription usage-limit pause/resume (see `s0-pilot/docs/spend-controls.md`).
 - **Repository secrets.** None added by this preparation. If a key is ever provisioned it
   goes behind the proxy, scoped and capped — a separate, approved step.
 
